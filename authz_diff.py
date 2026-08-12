@@ -43,6 +43,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Optional
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 __version__ = "1.0.0"
 
@@ -144,12 +145,27 @@ def apply_identity(base: Request, ident: Identity) -> Request:
 
 
 def swap_ids(req: Request, swaps: list[tuple[str, str]]) -> Request:
-    url = req.url
+    """Swap an object id in the request's PATH, QUERY and BODY only.
+
+    The scheme/host/port (authority) is never rewritten: a naive global
+    ``url.replace`` would let an id that also appears in the hostname
+    (``api10.site.com`` with ``--swap 10=20``) redirect the request to a
+    different, possibly out-of-scope host. We split the URL and only touch the
+    path and query.
+    """
+    parts = urlsplit(req.url)
+    path, query = parts.path, parts.query
     body = req.body.decode(errors="replace") if req.body else None
     for old, new in swaps:
-        url = url.replace(old, new)
+        if old and old in parts.netloc:
+            print(f"[!] swap '{old}'->'{new}' also matches the host "
+                  f"'{parts.netloc}' — host left UNTOUCHED (path/query/body only)",
+                  file=sys.stderr)
+        path = path.replace(old, new)
+        query = query.replace(old, new)
         if body is not None:
             body = body.replace(old, new)
+    url = urlunsplit((parts.scheme, parts.netloc, path, query, parts.fragment))
     return Request(method=req.method, url=url, headers=dict(req.headers),
                    body=body.encode() if body is not None else None)
 
@@ -185,6 +201,27 @@ def send(req: Request, timeout: int, verify: bool) -> Response:
 
 # ── scoring ─────────────────────────────────────────────────────────────────
 
+_SECRET_QS_KEYS = {"api_key", "apikey", "key", "token", "access_token", "auth",
+                   "secret", "password", "passwd", "sig", "signature",
+                   "session", "sid"}
+
+
+def _redact_url(url: str) -> str:
+    """Redact credential-ish query params so a written report / -o file never
+    persists a secret embedded in the URL (auth *headers* are already not
+    stored). Only the persisted/echoed URL is redacted — the live request still
+    uses the real value."""
+    try:
+        p = urlsplit(url)
+    except ValueError:
+        return url
+    if not p.query:
+        return url
+    pairs = parse_qsl(p.query, keep_blank_values=True)
+    red = [(k, "REDACTED" if k.lower() in _SECRET_QS_KEYS else v) for k, v in pairs]
+    return urlunsplit((p.scheme, p.netloc, p.path, urlencode(red), p.fragment))
+
+
 def similarity(a: bytes, b: bytes) -> float:
     if not a and not b:
         return 1.0
@@ -193,8 +230,17 @@ def similarity(a: bytes, b: bytes) -> float:
     return difflib.SequenceMatcher(None, sa, sb).ratio()
 
 
-def classify(baseline: Response, test: Response, ident: Identity) -> dict:
-    """Return a verdict dict for one identity vs the baseline (owner)."""
+def classify(baseline: Response, test: Response, ident: Identity,
+             swapped: bool = False) -> dict:
+    """Return a verdict dict for one identity vs the baseline (owner).
+
+    ``swapped`` is True when the tested request points at a *different* object
+    id than the owner baseline. In that case body-similarity to the owner's
+    original object is NOT a valid "same data" signal (two different objects
+    share only structural shape), so the verdict is driven by status alone:
+    any 2xx for an object id this identity was not given is a BOLA candidate to
+    confirm by hand.
+    """
     if test.error:
         return {"severity": "ERROR", "reason": f"request failed: {test.error}"}
     if baseline.status < 200 or baseline.status >= 300:
@@ -207,9 +253,22 @@ def classify(baseline: Response, test: Response, ident: Identity) -> dict:
     protected = test.status in (401, 403) or (test.status == 404 and baseline.status == 200)
 
     if protected:
-        return {"severity": "OK", "similarity": round(sim, 3),
-                "test_status": test.status,
-                "reason": f"identity '{ident.name}' correctly denied ({test.status})"}
+        why = f"identity '{ident.name}' correctly denied ({test.status})"
+        if swapped and test.status == 404:
+            why = (f"'{ident.name}' got 404 for the swapped object — denied OR the "
+                   "object id does not exist (inconclusive)")
+        return {"severity": "OK", "test_status": test.status, "reason": why}
+
+    if swapped:
+        # cross-object: similarity to the owner's original object is noise.
+        if 200 <= test.status < 300:
+            return {"severity": "MEDIUM", "test_status": test.status,
+                    "len_delta": len_delta,
+                    "reason": f"BOLA candidate: '{ident.name}' received 2xx for a "
+                              "swapped object id it was not given — confirm the "
+                              "returned object is not this identity's own data"}
+        return {"severity": "INFO", "test_status": test.status,
+                "reason": f"'{ident.name}' got status {test.status} for the swapped object"}
 
     # test got through (2xx / 3xx / other non-deny)
     is_unauth = ident.strip_auth
@@ -244,7 +303,8 @@ SEV_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3,
 
 def run(base_req: Request, identities: list[Identity], swaps: list[tuple[str, str]],
         timeout: int, verify: bool) -> dict:
-    results = {"url": base_req.url, "method": base_req.method, "findings": []}
+    results = {"url": _redact_url(base_req.url), "method": base_req.method,
+               "findings": []}
 
     print(f"[*] baseline (owner) -> {base_req.method} {base_req.url}", file=sys.stderr)
     baseline = send(base_req, timeout, verify)
@@ -264,11 +324,11 @@ def run(base_req: Request, identities: list[Identity], swaps: list[tuple[str, st
             test_req = apply_identity(req_for_swap, ident)
             print(f"[*] as '{ident.name}'{swap_label} ...", file=sys.stderr)
             test = send(test_req, timeout, verify)
-            verdict = classify(baseline, test, ident)
+            verdict = classify(baseline, test, ident, swapped=bool(swap))
             verdict["identity"] = ident.name
             if swap:
                 verdict["swap"] = f"{swap[0]}->{swap[1]}"
-            verdict["url"] = test_req.url
+            verdict["url"] = _redact_url(test_req.url)
             results["findings"].append(verdict)
 
     results["findings"].sort(key=lambda f: SEV_ORDER.get(f["severity"], 9))
@@ -290,10 +350,15 @@ def print_report(results: dict) -> None:
         print(line)
     sev = [f["severity"] for f in results["findings"]]
     hot = sum(1 for s in sev if s in ("CRITICAL", "HIGH"))
+    verify = sum(1 for s in sev if s == "MEDIUM")
+    bits = []
+    if hot:
+        bits.append(f"{hot} high-confidence finding(s) needing a PoC writeup")
+    if verify:
+        bits.append(f"{verify} to verify by hand (MEDIUM)")
+    tail = "; ".join(bits) if bits else "no cross-identity access detected"
     print("-" * 60)
-    print(f"{len(sev)} identities tested — "
-          f"{hot} likely access-control finding(s) needing a PoC writeup"
-          if hot else f"{len(sev)} identities tested — no cross-identity access detected")
+    print(f"{len(sev)} result(s) — {tail}")
 
 
 def parse_swaps(spec: Optional[str]) -> list[tuple[str, str]]:
@@ -358,8 +423,13 @@ def main(argv=None) -> None:
     print_report(results)
 
     if args.output:
-        # bodies are not stored in results; safe to dump
-        open(args.output, "w").write(json.dumps(results, indent=2))
+        # response bodies are never stored, auth headers are never stored, and
+        # credential-ish query params in URLs are redacted (_redact_url).
+        try:
+            with open(args.output, "w") as fh:
+                fh.write(json.dumps(results, indent=2))
+        except OSError as e:
+            sys.exit(f"[!] cannot write output file: {e}")
         print(f"[i] wrote {args.output}")
 
     hot = any(f["severity"] in ("CRITICAL", "HIGH") for f in results["findings"])
