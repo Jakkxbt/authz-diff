@@ -1,3 +1,14 @@
+<p align="center">
+  <img src="assets/banner.png" alt="CobraSEC · Blue Arsenal · authz-diff" width="100%">
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/CobraSEC-Blue_Arsenal-22d3ee?style=for-the-badge&labelColor=0a0f1a">
+  <img src="https://img.shields.io/badge/License-MIT-38bdf8?style=for-the-badge&labelColor=0a0f1a">
+  <img src="https://img.shields.io/badge/Python-3.x-7dd3fc?style=for-the-badge&labelColor=0a0f1a">
+  <img src="https://img.shields.io/badge/Status-Active-16a34a?style=for-the-badge&labelColor=0a0f1a">
+</p>
+
 # authz-diff
 
 Access-control / IDOR tester by response differencing.
